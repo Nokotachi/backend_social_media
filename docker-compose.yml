@@ -1,0 +1,138 @@
+# Весь бэкенд одной командой:
+#   docker compose up -d --build
+#
+# User Service:    http://localhost:8000/docs
+# Content Service: http://localhost:8001/docs
+# MinIO console:   http://localhost:9001   (MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
+# RabbitMQ:        http://localhost:15672  (RABBITMQ_USER / RABBITMQ_PASSWORD)
+#
+# Все значения (пароли, порты, почта) берутся из .env рядом с этим файлом, образец —
+# .env.example. 
+
+x-common: &common
+  CORS_ORIGINS: ${CORS_ORIGINS:?задайте в .env}
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER:?задайте в .env}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?задайте в .env}
+  MINIO_PORT: ${MINIO_PORT:?задайте в .env}
+  RABBITMQ_USER: ${RABBITMQ_USER:?задайте в .env}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?задайте в .env}
+  DB_HOST: db
+  DB_PORT: 5432
+  S3_ENDPOINT: minio:9000
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?задайте в .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте в .env}
+      POSTGRES_DB: postgres
+      USER_DB_PASSWORD: ${USER_DB_PASSWORD:?задайте в .env}
+      CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:?задайте в .env}
+      RECOMMENDATION_DB_PASSWORD: ${RECOMMENDATION_DB_PASSWORD:?задайте в .env}
+    ports:
+      - "127.0.0.1:${DB_PORT:?задайте в .env}:5432"
+    volumes:
+      - pgdata_services:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/schemas:/schemas:ro
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=$${POSTGRES_PASSWORD} psql -h 127.0.0.1 -U $${POSTGRES_USER} -d recommendation_db -c 'select 1' >/dev/null"]
+      interval: 3s
+      retries: 30
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?задайте в .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?задайте в .env}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:?задайте в .env}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:?задайте в .env}:9001"
+    volumes:
+      - minio_data:/data
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?задайте в .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?задайте в .env}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:?задайте в .env}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:?задайте в .env}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 30
+
+  jwt_keys:
+    build: ./user_service
+    command: ["python", "-m", "user_service.keygen", "/keys/private", "/keys/public"]
+    volumes:
+      - jwt_private:/keys/private
+      - jwt_public:/keys/public
+
+  user_service:
+    build: ./user_service
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      jwt_keys:
+        condition: service_completed_successfully
+    environment:
+      <<: *common
+      USER_DB_PASSWORD: ${USER_DB_PASSWORD:?задайте в .env}
+      JWT_PRIVATE_KEY_FILE: /run/keys/jwt_private.pem
+      SMTP_HOST: ${SMTP_HOST:?задайте в .env}
+      SMTP_PORT: ${SMTP_PORT:?задайте в .env}
+      SMTP_USERNAME: ${SMTP_USERNAME:?задайте в .env}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:?задайте в .env}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:?задайте в .env}
+      SMTP_SSL: ${SMTP_SSL:?задайте в .env}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - jwt_private:/run/keys:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  content_service:
+    build: ./content_service
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      jwt_keys:
+        condition: service_completed_successfully
+    environment:
+      <<: *common
+      CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:?задайте в .env}
+      JWT_PUBLIC_KEY_FILE: /run/keys/jwt_public.pem
+    volumes:
+      - jwt_public:/run/keys:ro
+    ports:
+      - "127.0.0.1:8001:8001"
+
+volumes:
+  pgdata_services:
+  minio_data:
+  rabbitmq_data:
+  jwt_private:
+  jwt_public:
